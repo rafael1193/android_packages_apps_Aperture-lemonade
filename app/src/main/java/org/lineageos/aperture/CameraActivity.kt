@@ -52,6 +52,8 @@ import androidx.camera.camera2.interop.CaptureRequestOptions
 import androidx.camera.core.AspectRatio
 import androidx.camera.core.ImageCapture
 import androidx.camera.core.ImageCaptureException
+import androidx.camera.core.MirrorMode
+import androidx.camera.core.impl.StreamSpec
 import androidx.camera.core.resolutionselector.AspectRatioStrategy
 import androidx.camera.core.resolutionselector.ResolutionSelector
 import androidx.camera.extensions.ExtensionMode
@@ -103,6 +105,9 @@ import org.lineageos.aperture.camera.FrameRate
 import org.lineageos.aperture.camera.HotPixelMode
 import org.lineageos.aperture.camera.NoiseReductionMode
 import org.lineageos.aperture.camera.ShadingMode
+import org.lineageos.aperture.camera.VideoDynamicRange
+import org.lineageos.aperture.camera.VideoMirrorMode
+import org.lineageos.aperture.camera.VideoQualityInfo
 import org.lineageos.aperture.camera.VideoStabilizationMode
 import org.lineageos.aperture.ext.*
 import org.lineageos.aperture.qr.QrImageAnalyzer
@@ -173,6 +178,7 @@ open class CameraActivity : AppCompatActivity() {
     private val videoFrameRateButton by lazy { findViewById<Button>(R.id.videoFrameRateButton) }
     private val videoQualityButton by lazy { findViewById<Button>(R.id.videoQualityButton) }
     private val videoRecordingStateButton by lazy { findViewById<ImageButton>(R.id.videoRecordingStateButton) }
+    private val videoDynamicRangeButton by lazy { findViewById<Button>(R.id.videoDynamicRangeButton) }
     private val viewFinder by lazy { findViewById<PreviewView>(R.id.viewFinder) }
     private val viewFinderFocus by lazy { findViewById<ImageView>(R.id.viewFinderFocus) }
     private val zoomLevel by lazy { findViewById<HorizontalSlider>(R.id.zoomLevel) }
@@ -211,6 +217,7 @@ open class CameraActivity : AppCompatActivity() {
     private var photoEffect by nonNullablePropertyDelegate { model.photoEffect }
     private var videoQuality by nonNullablePropertyDelegate { model.videoQuality }
     private var videoFrameRate by nullablePropertyDelegate { model.videoFrameRate }
+    private var videoDynamicRange by nonNullablePropertyDelegate { model.videoDynamicRange }
     private var videoMicMode by nonNullablePropertyDelegate { model.videoMicMode }
     private var videoRecording by nullablePropertyDelegate { model.videoRecording }
     private var videoDuration by nonNullablePropertyDelegate { model.videoRecordingDuration }
@@ -228,10 +235,12 @@ open class CameraActivity : AppCompatActivity() {
     // Video
     private val supportedVideoQualities: Set<Quality>
         get() = camera.supportedVideoQualities.keys
+    private val videoQualityInfo: VideoQualityInfo?
+        get() = camera.supportedVideoQualities[videoQuality]
     private val supportedVideoFrameRates: Set<FrameRate>
-        get() = camera.supportedVideoQualities.getOrDefault(
-            videoQuality, setOf()
-        )
+        get() = videoQualityInfo?.supportedFrameRates ?: setOf()
+    private val supportedVideoDynamicRanges: Set<VideoDynamicRange>
+        get() = videoQualityInfo?.supportedDynamicRanges ?: setOf()
     private lateinit var videoAudioConfig: AudioConfig
 
     // QR
@@ -573,6 +582,7 @@ open class CameraActivity : AppCompatActivity() {
         photoEffect = sharedPreferences.photoEffect
         videoQuality = sharedPreferences.videoQuality
         videoFrameRate = sharedPreferences.videoFrameRate
+        videoDynamicRange = sharedPreferences.videoDynamicRange
         videoMicMode = sharedPreferences.lastMicMode
 
         // Handle intent
@@ -627,6 +637,7 @@ open class CameraActivity : AppCompatActivity() {
         aspectRatioButton.setOnClickListener { cycleAspectRatio() }
         videoQualityButton.setOnClickListener { cycleVideoQuality() }
         videoFrameRateButton.setOnClickListener { cycleVideoFrameRate() }
+        videoDynamicRangeButton.setOnClickListener { cycleVideoDynamicRange() }
         effectButton.setOnClickListener { cyclePhotoEffects() }
         gridButton.setOnClickListener { cycleGridMode() }
         timerButton.setOnClickListener { toggleTimerMode() }
@@ -868,6 +879,7 @@ open class CameraActivity : AppCompatActivity() {
             aspectRatioButton.isVisible = cameraMode != CameraMode.VIDEO
             videoQualityButton.isVisible = cameraMode == CameraMode.VIDEO
             videoFrameRateButton.isVisible = cameraMode == CameraMode.VIDEO
+            videoDynamicRangeButton.isVisible = cameraMode == CameraMode.VIDEO
             micButton.isVisible = cameraMode == CameraMode.VIDEO
 
             updateSecondaryTopBarButtons()
@@ -1084,6 +1096,16 @@ open class CameraActivity : AppCompatActivity() {
             videoFrameRateButton.text = videoFrameRate?.let { frameRate ->
                 resources.getString(R.string.video_framerate_value, frameRate.value)
             } ?: resources.getString(R.string.video_framerate_auto)
+        }
+
+        model.videoDynamicRange.observe(this) {
+            val videoDynamicRange = it
+
+            // Update secondary bar buttons
+            videoDynamicRangeButton.setCompoundDrawablesWithIntrinsicBounds(
+                0, videoDynamicRange.icon, 0, 0
+            )
+            videoDynamicRangeButton.setText(videoDynamicRange.title)
         }
 
         // Observe video mic mode
@@ -1534,7 +1556,27 @@ open class CameraActivity : AppCompatActivity() {
                 // Set proper video frame rate
                 videoFrameRate = (FrameRate::getLowerOrHigher)(
                     videoFrameRate ?: FrameRate.FPS_30, supportedVideoFrameRates
-                )
+                ).also {
+                    cameraController.videoCaptureTargetFrameRate =
+                        it?.range ?: StreamSpec.FRAME_RATE_RANGE_UNSPECIFIED
+                }
+
+                // Set video dynamic range
+                videoDynamicRange = (videoDynamicRange.takeIf {
+                    supportedVideoDynamicRanges.contains(it)
+                } ?: supportedVideoDynamicRanges.first()).also {
+                    cameraController.videoCaptureDynamicRange = it.dynamicRange
+                }
+
+                // Set video mirror mode
+                cameraController.videoCaptureMirrorMode = when (sharedPreferences.videoMirrorMode) {
+                    VideoMirrorMode.OFF -> MirrorMode.MIRROR_MODE_OFF
+                    VideoMirrorMode.ON -> MirrorMode.MIRROR_MODE_ON
+                    VideoMirrorMode.ON_FRONT_ONLY -> when (camera.cameraFacing) {
+                        CameraFacing.FRONT -> MirrorMode.MIRROR_MODE_ON
+                        else -> MirrorMode.MIRROR_MODE_OFF
+                    }
+                }
 
                 CameraController.VIDEO_CAPTURE
             }
@@ -1641,13 +1683,6 @@ open class CameraActivity : AppCompatActivity() {
             cameraController.camera2CameraControl?.apply {
                 captureRequestOptions = CaptureRequestOptions.Builder()
                     .apply {
-                        setFrameRate(
-                            if (cameraMode == CameraMode.VIDEO) {
-                                videoFrameRate
-                            } else {
-                                null
-                            }
-                        )
                         setVideoStabilizationMode(
                             if (cameraMode == CameraMode.VIDEO &&
                                 sharedPreferences.videoStabilization
@@ -1862,9 +1897,9 @@ open class CameraActivity : AppCompatActivity() {
             val videoRecording = model.videoRecording.value
 
             val supportedVideoQualities = camera.supportedVideoQualities
-            val supportedVideoFrameRates = supportedVideoQualities.getOrDefault(
-                videoQuality, setOf()
-            )
+            val videoQualityInfo = supportedVideoQualities[videoQuality]
+            val supportedVideoFrameRates = videoQualityInfo?.supportedFrameRates ?: setOf()
+            val supportedVideoDynamicRanges = videoQualityInfo?.supportedDynamicRanges ?: setOf()
 
             flashButton.isEnabled =
                 cameraMode != CameraMode.PHOTO || cameraState == CameraState.IDLE
@@ -1875,6 +1910,8 @@ open class CameraActivity : AppCompatActivity() {
                 cameraState == CameraState.IDLE && supportedVideoQualities.size > 1
             videoFrameRateButton.isEnabled =
                 cameraState == CameraState.IDLE && supportedVideoFrameRates.size > 1
+            videoDynamicRangeButton.isEnabled =
+                cameraState == CameraState.IDLE && supportedVideoDynamicRanges.size > 1
             micButton.isEnabled =
                 cameraState == CameraState.IDLE || videoRecording?.isAudioSourceConfigured == true
         }
@@ -1949,6 +1986,26 @@ open class CameraActivity : AppCompatActivity() {
         videoFrameRate = newVideoFrameRate
 
         sharedPreferences.videoFrameRate = videoFrameRate
+
+        bindCameraUseCases()
+    }
+
+    private fun cycleVideoDynamicRange() {
+        if (!canRestartCamera()) {
+            return
+        }
+
+        val currentVideoDynamicRange = videoDynamicRange
+        val newVideoDynamicRange =
+            supportedVideoDynamicRanges.toList().sorted().next(currentVideoDynamicRange)
+
+        if (newVideoDynamicRange == currentVideoDynamicRange) {
+            return
+        }
+
+        videoDynamicRange = newVideoDynamicRange
+
+        sharedPreferences.videoDynamicRange = videoDynamicRange
 
         bindCameraUseCases()
     }
